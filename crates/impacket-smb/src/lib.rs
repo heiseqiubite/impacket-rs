@@ -1024,6 +1024,27 @@ pub struct SmbConnection {
     encryption_required: bool,
 }
 
+/// Returns 16 bytes derived from the standard library's OS-seeded `RandomState` (no external
+/// crates). Used for the NTLMv2 client challenge and the exported session key.
+fn random_bytes_16() -> [u8; 16] {
+    use std::collections::hash_map::RandomState;
+    use std::hash::{BuildHasher, Hasher};
+    let mut out = [0u8; 16];
+    for (idx, chunk) in out.chunks_mut(8).enumerate() {
+        let mut hasher = RandomState::new().build_hasher();
+        hasher.write_u128(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0x1337),
+        );
+        hasher.write_u32(std::process::id());
+        hasher.write_usize(idx);
+        chunk.copy_from_slice(&hasher.finish().to_le_bytes());
+    }
+    out
+}
+
 impl SmbConnection {
     fn next_mid(&mut self) -> u64 {
         let m = self.message_id;
@@ -1206,16 +1227,7 @@ impl SmbConnection {
             SmbCredential::Password(p) => compute_ntlm_hashes(p),
             SmbCredential::NtlmHashes(h) => h.clone(),
         };
-        let client_challenge: [u8; 8] = {
-            let nanos = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.subsec_nanos())
-                .unwrap_or(0x1337);
-            let mut c = [0u8; 8];
-            c[..4].copy_from_slice(&nanos.to_le_bytes());
-            c[4..].copy_from_slice(&(nanos ^ 0xA5A5_A5A5).to_le_bytes());
-            c
-        };
+        let client_challenge: [u8; 8] = random_bytes_16()[..8].try_into().unwrap();
         let timestamp = challenge
             .target_info
             .timestamp
@@ -1230,8 +1242,19 @@ impl SmbConnection {
             timestamp,
             target_info_raw,
         );
-        // With NTLMSSP_NEGOTIATE_KEY_EXCH cleared, the exported session key is the session base key.
-        let session_key = v2.session_base_key;
+        // [MS-NLMP] 3.1.5.1.2: when the server negotiates NTLMSSP_NEGOTIATE_KEY_EXCH, export a
+        // random session key and send it RC4-encrypted under the session base key. The exported
+        // key (not the base key) is then used for SMB signing/encryption.
+        let session_base_key = v2.session_base_key;
+        let (session_key, encrypted_session_key) =
+            if (challenge.flags & ntlm_flags::NTLMSSP_NEGOTIATE_KEY_EXCH) != 0 {
+                let exported = random_bytes_16();
+                let mut encrypted = exported;
+                impacket_crypto::Rc4::new(&session_base_key).apply_keystream(&mut encrypted);
+                (exported, encrypted.to_vec())
+            } else {
+                (session_base_key, Vec::new())
+            };
         self.session_key = session_key;
 
         let type3 = NtlmAuthenticateMessage {
@@ -1240,8 +1263,8 @@ impl SmbConnection {
             workstation: workstation.to_string(),
             lm_challenge_response: v2.lm_challenge_response,
             nt_challenge_response: v2.nt_challenge_response,
-            encrypted_session_key: Vec::new(),
-            flags: challenge.flags & !ntlm_flags::NTLMSSP_NEGOTIATE_KEY_EXCH,
+            encrypted_session_key,
+            flags: challenge.flags,
             os_major: 10,
             os_minor: 0,
             os_build: 19041,
