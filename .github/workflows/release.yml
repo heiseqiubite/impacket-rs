@@ -4,20 +4,35 @@ on:
   push:
     tags:
       - 'v*'
-  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+  BIN_NAME: impacket-rs
 
 jobs:
   create-release:
     runs-on: ubuntu-latest
-    permissions:
-      contents: write
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          fetch-depth: 0
       - name: Create GitHub Release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          gh release create "${{ github.ref_name }}" --title "Impacket-RS ${{ github.ref_name }}" --generate-notes || true
+          TAG="${GITHUB_REF_NAME}"
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            echo "Release $TAG already exists, reusing it."
+          else
+            PRE=""
+            case "$TAG" in *-*) PRE="--prerelease" ;; esac
+            gh release create "$TAG" \
+              --title "Impacket-RS $TAG" \
+              --generate-notes $PRE
+          fi
 
   upload-assets:
     name: Build & Upload (${{ matrix.target }})
@@ -31,32 +46,68 @@ jobs:
         include:
           - target: x86_64-unknown-linux-musl
             os: ubuntu-latest
-            bin_name: impacket-rs
           - target: aarch64-unknown-linux-musl
             os: ubuntu-latest
-            bin_name: impacket-rs
+            use_cross: true
           - target: aarch64-apple-darwin
             os: macos-latest
-            bin_name: impacket-rs
           - target: x86_64-apple-darwin
-            os: macos-13
-            bin_name: impacket-rs
+            os: macos-latest
           - target: x86_64-pc-windows-msvc
             os: windows-latest
-            bin_name: impacket-rs.exe
           - target: aarch64-pc-windows-msvc
             os: windows-latest
-            bin_name: impacket-rs.exe
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
-      - name: Add Rust target
-        run: rustup target add ${{ matrix.target }}
-      - name: Build release binary
-        run: cargo build --release --target ${{ matrix.target }}
-      - name: Upload release asset
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Sync workspace version with tag
         shell: bash
         run: |
-          tar -czf "impacket-rs-${{ matrix.target }}.tar.gz" -C "target/${{ matrix.target }}/release" "${{ matrix.bin_name }}"
-          gh release upload "${{ github.ref_name }}" "impacket-rs-${{ matrix.target }}.tar.gz" --clobber
+          version="${GITHUB_REF_NAME#v}"
+          sed -i.bak -E "s/^version = \".*\"/version = \"${version}\"/" Cargo.toml
+          cargo update -w
+
+      - name: Add Rust target
+        run: rustup target add ${{ matrix.target }}
+
+      - name: Install cross
+        if: matrix.use_cross
+        run: cargo install cross --locked
+
+      - name: Build with cross
+        if: matrix.use_cross
+        run: cross build --release --target ${{ matrix.target }} -p ${{ env.BIN_NAME }}
+
+      - name: Build with cargo
+        if: ${{ !matrix.use_cross }}
+        run: cargo build --release --target ${{ matrix.target }} -p ${{ env.BIN_NAME }}
+
+      - name: Package (Unix)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          archive="${BIN_NAME}-${{ matrix.target }}.tar.gz"
+          tar -czf "$archive" -C "target/${{ matrix.target }}/release" "${BIN_NAME}"
+          if command -v sha256sum >/dev/null 2>&1; then
+            sha256sum "$archive" > "$archive.sha256"
+          else
+            shasum -a 256 "$archive" > "$archive.sha256"
+          fi
+
+      - name: Package (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $archive = "$env:BIN_NAME-${{ matrix.target }}.zip"
+          Compress-Archive -Path "target/${{ matrix.target }}/release/$env:BIN_NAME.exe" -DestinationPath $archive
+          $hash = (Get-FileHash $archive -Algorithm SHA256).Hash.ToLower()
+          "$hash  $archive" | Out-File -Encoding ascii "$archive.sha256"
+
+      - name: Upload release assets
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release upload "${GITHUB_REF_NAME}" \
+            "${BIN_NAME}-${{ matrix.target }}."* \
+            --clobber
