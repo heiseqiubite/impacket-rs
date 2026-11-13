@@ -1098,6 +1098,11 @@ impl SmbConnection {
     }
 
     fn header_status(pdu: &[u8]) -> Result<NtStatus, CoreError> {
+        if pdu.is_empty() {
+            return Err(CoreError::ProtocolError(
+                "SMB connection closed by peer (no response)".into(),
+            ));
+        }
         if pdu.len() < 64 || pdu[0..4] != Smb2Header::MAGIC {
             return Err(CoreError::ProtocolError("Not an SMB2 response".into()));
         }
@@ -1136,6 +1141,9 @@ impl SmbConnection {
         conn.update_preauth(&neg);
         let resp = conn.send(&neg)?;
         conn.update_preauth(&resp);
+        // NEGOTIATE used MessageId 0; advance so SESSION_SETUP starts at 1 instead of
+        // reusing 0, which makes Samba/Windows drop the connection.
+        conn.message_id = 1;
         let summary = Smb2NegotiateResponseSummary::parse(&resp)?;
         conn.negotiated_dialect = summary.dialect_revision;
         conn.signing_required = (summary.security_mode & 0x02) != 0;
